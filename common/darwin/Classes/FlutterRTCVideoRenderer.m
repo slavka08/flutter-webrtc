@@ -10,6 +10,34 @@
 
 #import "FlutterWebRTCPlugin.h"
 #import <os/lock.h>
+#import <stdatomic.h>
+
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#elif TARGET_OS_OSX
+#import <AppKit/AppKit.h>
+#endif
+
+// Guards against a crash on app termination: the Flutter engine is destroyed
+// on the main thread (inside the will-terminate notification callout) while
+// WebRTC's IncomingVideoStream thread is still delivering frames. The
+// engine's FlutterTextureRegistryRelay holds its parent via an unowned
+// (assign) reference, so [_registry textureFrameAvailable:] dereferences a
+// dangling engine pointer (SIGSEGV on queue "IncomingVideoStream").
+//
+// The observer below is registered in +load — the earliest possible
+// registration in the process. NSNotificationCenter does not officially
+// guarantee delivery order, but in practice observers fire in registration
+// order, so this block is expected to run before the engine's own
+// will-terminate observer in the same notification post (an empirical
+// assumption, not a contract; the atomic flag below is the fallback if it
+// ever breaks). It flags termination and synchronously detaches every live
+// renderer from its track; RTCVideoTrack removeRenderer: blocks on WebRTC's
+// broadcaster mutex until any in-flight renderFrame completes, so once it
+// returns no WebRTC thread can touch the texture registry again.
+static atomic_bool _applicationTerminating = false;
+static NSHashTable<FlutterRTCVideoRenderer*>* _liveRenderers = nil;
+static os_unfair_lock _liveRenderersLock = OS_UNFAIR_LOCK_INIT;
 
 @implementation FlutterRTCVideoRenderer {
   CGSize _frameSize;
@@ -26,6 +54,28 @@
 @synthesize registry = _registry;
 @synthesize eventSink = _eventSink;
 @synthesize videoTrack = _videoTrack;
+
++ (void)load {
+#if TARGET_OS_IPHONE
+  NSNotificationName terminateNotification = UIApplicationWillTerminateNotification;
+#elif TARGET_OS_OSX
+  NSNotificationName terminateNotification = NSApplicationWillTerminateNotification;
+#endif
+  [[NSNotificationCenter defaultCenter]
+      addObserverForName:terminateNotification
+                  object:nil
+                   queue:nil
+              usingBlock:^(NSNotification* notification) {
+                atomic_store(&_applicationTerminating, true);
+                NSArray<FlutterRTCVideoRenderer*>* renderers = nil;
+                os_unfair_lock_lock(&_liveRenderersLock);
+                renderers = _liveRenderers.allObjects;
+                os_unfair_lock_unlock(&_liveRenderersLock);
+                for (FlutterRTCVideoRenderer* renderer in renderers) {
+                  renderer.videoTrack = nil;
+                }
+              }];
+}
 
 - (instancetype)initWithTextureRegistry:(id<FlutterTextureRegistry>)registry
                               messenger:(NSObject<FlutterBinaryMessenger>*)messenger {
@@ -47,6 +97,12 @@
         eventChannelWithName:[NSString stringWithFormat:@"FlutterWebRTC/Texture%lld", _textureId]
              binaryMessenger:messenger];
     [_eventChannel setStreamHandler:self];
+    os_unfair_lock_lock(&_liveRenderersLock);
+    if (_liveRenderers == nil) {
+      _liveRenderers = [NSHashTable weakObjectsHashTable];
+    }
+    [_liveRenderers addObject:self];
+    os_unfair_lock_unlock(&_liveRenderersLock);
   }
   return self;
 }
@@ -192,6 +248,11 @@
 
 #pragma mark - RTCVideoRenderer methods
 - (void)renderFrame:(RTCVideoFrame*)frame {
+  // The engine (and its texture registry) is being torn down; touching it
+  // from this WebRTC thread would dereference a dangling pointer.
+  if (atomic_load(&_applicationTerminating)) {
+    return;
+  }
 
   os_unfair_lock_lock(&_lock);
   if(_videoTrack == nil) {
@@ -211,6 +272,9 @@
   if (_renderSize.width != frame.width || _renderSize.height != frame.height) {
     dispatch_async(dispatch_get_main_queue(), ^{
       FlutterRTCVideoRenderer* strongSelf = weakSelf;
+      if (atomic_load(&_applicationTerminating)) {
+        return;
+      }
       if (strongSelf.eventSink) {
         strongSelf.eventSink(@{
           @"event" : @"didTextureChangeVideoSize",
@@ -226,6 +290,9 @@
   if (frame.rotation != _rotation) {
     dispatch_async(dispatch_get_main_queue(), ^{
       FlutterRTCVideoRenderer* strongSelf = weakSelf;
+      if (atomic_load(&_applicationTerminating)) {
+        return;
+      }
       if (strongSelf.eventSink) {
         strongSelf.eventSink(@{
           @"event" : @"didTextureChangeRotation",
@@ -241,6 +308,9 @@
   // Notify the Flutter new pixelBufferRef to be ready.
   dispatch_async(dispatch_get_main_queue(), ^{
     FlutterRTCVideoRenderer* strongSelf = weakSelf;
+    if (atomic_load(&_applicationTerminating)) {
+      return;
+    }
     if (!strongSelf->_isFirstFrameRendered) {
       if (strongSelf.eventSink) {
         strongSelf.eventSink(@{@"event" : @"didFirstFrameRendered"});
