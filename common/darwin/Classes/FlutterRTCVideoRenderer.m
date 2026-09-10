@@ -119,6 +119,8 @@ static os_unfair_lock _liveRenderersLock = OS_UNFAIR_LOCK_INIT;
 }
 
 - (void)dispose {
+  [_eventChannel setStreamHandler:nil];
+  _eventChannel = nil;
   os_unfair_lock_lock(&_lock);
   [_registry unregisterTexture:_textureId];
   _textureId = -1;
